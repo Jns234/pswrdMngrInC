@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sodium.h>
 #include <unistd.h>
+#include <openssl/evp.h>
 
 #define SQL_FILE "test.db"
 #define SQLITE_HAS_CODEC 1
@@ -13,10 +14,8 @@ sqlite3 *db;
 sqlite3_stmt *stmt = NULL;
 
 
-char MasterKey[20];
+char MasterHash[crypto_pwhash_STRBYTES];
 int i;
-char *passwordDb = "demo";
-
 
 // Need to declare functions
 int init_db();
@@ -30,6 +29,9 @@ int checkInitiaMaster();
 void initMasterPass();
 int getMasterhash(char *out, size_t out_size);
 int check_db();
+int first_db_init();
+int request_password(char *out, size_t out_size);
+int set_master_hash(char MasterPassword);
 
 int callback(void *NotUsed, int argc, char **argv, char **azColName)  {
     for (int i = 0; i < argc; i++){
@@ -63,19 +65,23 @@ int main()
         return 1;
     }
 
-    init_db();
-
-    MasterKeyStart:
-    if ( AskForPassword() != 0) {
-        printf("Couldn't log in!\n");
-        return 1;
+    if (init_db() != 0) {
+        printf("Error in first step, database init\n");
     }
+
+//    MasterKeyStart:
+//    if ( AskForPassword() != 0) {
+//        printf("Couldn't log in!\n");
+//        return 1;
+//    }
     
     Start:
 
     int command;
 
     printf("This is the CLI Password Manager prototype!\n");
+
+    printf("Here are your options:\n\t0 - Save a password\n\t1 - List possible passwords\n\t2 - Read a password\n\t3 - Edit a password\n");
 
     printf("Waiting for a command\n");
 
@@ -107,6 +113,180 @@ int main()
         sqlite3_close(db);
     }
     sqlite3_close(db);
+    return 0;
+}
+
+int init_db()
+{   
+    char MasterPassword[20];
+
+    if (check_db() != 0) {
+        printf("No database file present\n");
+        if (first_db_init() != 0) {
+            printf("Error initializing db!\n");
+            return 1;
+        } 
+        return 0;
+    }
+
+    if (request_password(MasterPassword, sizeof MasterPassword) != 0) {
+        printf("Error, could not get password!\n");
+        return 1;
+    }
+
+    if (set_master_hash(MasterPassword) != 0){
+        printf("error in hashing password\n");
+    }
+
+    char *err_msg  = 0;
+    int response_code = sqlite3_open(SQL_FILE, &db);
+
+    if (response_code != SQLITE_OK) {
+        fprintf(stderr, "Cannot connect to database: %s \n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        
+        return 1;
+    }
+
+    response_code = sqlite3_key(db, MasterPassword, strlen(MasterPassword));
+    
+    if(response_code != SQLITE_OK){
+        printf("failed to key database\n");
+    }
+    
+    return 0;
+}
+
+int check_db()
+{
+    if (access(SQL_FILE, F_OK) == 0) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
+
+int first_db_init()
+{
+    char MasterPassword[20];
+
+    if (request_password(MasterPassword, sizeof MasterPassword) != 0) {
+        printf("Error, could not get password!\n");
+        return 1;
+    }
+    if (set_master_hash(MasterPassword) != 0){
+        printf("error in hashing password\n");
+    }
+    char *err_msg  = 0;
+    int response_code = sqlite3_open(SQL_FILE, &db);
+
+    if (response_code != SQLITE_OK) {
+        fprintf(stderr, "Cannot connect to database: %s \n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        
+        return 1;
+    }
+
+    response_code = sqlite3_key(db, MasterPassword, strlen(MasterPassword));
+    
+    if(response_code != SQLITE_OK){
+        printf("failed to key database\n");
+    }
+
+    char *sql = "CREATE TABLE IF NOT EXISTS Passwords(Id INTEGER PRIMARY KEY, Account TEXT, Site TEXT, Password TEXT);";
+
+    response_code = sqlite3_exec(db,sql, 0, 0, &err_msg);
+    if (response_code != SQLITE_OK) {
+        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
+
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        
+        return 1;
+    }
+
+    return 0;
+}
+
+int request_password(char *out, size_t out_size)
+{
+    char MasterPassword[20];
+
+    printf("Please enter your password:\n");
+    scanf("%s", MasterPassword);
+    int len = strlen(MasterPassword);
+
+    if ((size_t)len >= out_size) {
+        fprintf(stderr, "Buffer too small\n");
+        return 1;
+    }
+
+    memcpy(out, MasterPassword, len);
+    out[len] = '\0';
+
+    return 0;
+}
+
+int handle_pass_insert() {
+    char Account[30];
+    char Site[40];
+    char Password[30];
+
+    printf("You've chosen to add a password!\n");
+
+    printf("Please enter the email/account you wish to add:\n");
+    scanf("%s", Account);
+
+    printf("Please enter the site you wish to add:\n");
+    scanf("%s", Site);
+
+    printf("Please enter the password you wish to add:\n");
+    scanf("%s", Password);
+
+    printf("Here's waht you will add: %s, %s, %s \n", Account, Site, Password);
+    
+    add_pass(Account, Site, Password);
+
+    return 0;
+}
+
+
+int add_pass(char *Account, char *Site, char *Password) 
+{
+    char *err_msg = 0;
+    char *sql = "INSERT INTO Passwords(Account, Site, Password) VALUES(?, ?, ?);";
+
+    
+    //int rc = sqlite3_exec(db, sql, callback, 0, &err_msg);
+    int rc = sqlite3_prepare_v2(db, sql, strlen(sql)+1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
+
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        
+        return 1;
+    }
+    
+
+
+    sqlite3_bind_text(stmt, 1, Account, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, Site, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, Password, -1, SQLITE_STATIC);
+ 
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    return rc;
+}
+
+int set_master_hash(char MasterPassword)
+{
+    if (crypto_pwhash_str(MasterHash, MasterPassword, strlen(MasterPassword), crypto_pwhash_OPSLIMIT_SENSITIVE, crypto_pwhash_MEMLIMIT_SENSITIVE) != 0) {
+    /* out of memory */
+        return 1;
+    }
+
     return 0;
 }
 
@@ -165,7 +345,6 @@ int read_password(int* Id)
 }
 
 
-
 int list_pass() 
 {
     char *err_msg = 0;
@@ -186,110 +365,14 @@ int list_pass()
 }
 
 
-int handle_pass_insert() {
-    char Account[30];
-    char Site[40];
-    char Password[30];
 
-    printf("You've chosen to add a password!\n");
 
-    printf("Please enter the email/account you wish to add:\n");
-    scanf("%s", Account);
 
-    printf("Please enter the site you wish to add:\n");
-    scanf("%s", Site);
 
-    printf("Please enter the password you wish to add:\n");
-    scanf("%s", Password);
 
-    printf("Here's waht you will add: %s, %s, %s \n", Account, Site, Password);
-    
-    add_pass(Account, Site, Password);
 
-    return 0;
-}
 
-int add_pass(char *Account, char *Site, char *Password) 
-{
-    char *err_msg = 0;
-    char *sql = "INSERT INTO Passwords(Account, Site, Password) VALUES(?, ?, ?);";
 
-    //int rc = sqlite3_exec(db, sql, callback, 0, &err_msg);
-    int rc = sqlite3_prepare_v2(db, sql, strlen(sql)+1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-
-        sqlite3_free(err_msg);
-        sqlite3_close(db);
-        
-        return 1;
-    }
-
-    sqlite3_bind_text(stmt, 1, Account, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, Site, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, Password, -1, SQLITE_STATIC);
- 
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    return rc;
-}
-int check_db()
-{
-    if (access(SQL_FILE, F_OK) == 0) {
-        return 0;
-    } else {
-        return 1;
-    }
-}
-
-int init_db()
-{
-
-    if (check_db() != 0) {
-        printf("No database file present");
-    }
-
-    char *err_msg  = 0;
-    int response_code = sqlite3_open(SQL_FILE, &db);
-
-    if (response_code != SQLITE_OK) {
-        fprintf(stderr, "Cannot connect to database: %s \n", sqlite3_errmsg(db));
-        sqlite3_close(db);
-        
-        return 1;
-    }
-
-    response_code = sqlite3_key(db, passwordDb, strlen(passwordDb));
-    
-    if(response_code != SQLITE_OK){
-    printf("failed to key database\n");
-    }
-
-    char *sql = "CREATE TABLE IF NOT EXISTS Passwords(Id INTEGER PRIMARY KEY, Account TEXT, Site TEXT, Password TEXT);";
-    char *sqlHash ="CREATE TABLE IF NOT EXISTS Hash (Key TEXT PRIMARY KEY, Value TEXT);";
-
-    response_code = sqlite3_exec(db,sql, 0, 0, &err_msg);
-    if (response_code != SQLITE_OK) {
-        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-
-        sqlite3_free(err_msg);
-        sqlite3_close(db);
-        
-        return 1;
-    }
-    response_code = sqlite3_exec(db,sqlHash, 0, 0, &err_msg);
-    if (response_code != SQLITE_OK) {
-        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-
-        sqlite3_free(err_msg);
-        sqlite3_close(db);
-        
-        return 1;
-    }
-
-    return 0;
-}
 
 int checkInitiaMaster()
 {
