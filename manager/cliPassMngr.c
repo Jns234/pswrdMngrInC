@@ -4,17 +4,25 @@
 #include <stdint.h>
 #include <sodium.h>
 #include <unistd.h>
-#include <openssl/evp.h>
 
 #define SQL_FILE "test.db"
 #define SQLITE_HAS_CODEC 1
+#define KEY_BYTES crypto_secretbox_KEYBYTES
+#define SAVED_PASSWORD_LEN 50
 
-// Declaring the pointerfor the sqlite db
+// Binary salt (16 bytes) – in a real app, store & load this from disk/db
+static const unsigned char SALT[crypto_pwhash_SALTBYTES] = {
+    0xC1, 0x2B, 0x5F, 0xED,
+    0x66, 0x00, 0x52, 0x14,
+    0x80, 0x4E, 0xA6, 0x93,
+    0x4B, 0x1C, 0x52, 0xC6
+};
+
+// Declaring the pointer for the sqlite db
 sqlite3 *db;
 sqlite3_stmt *stmt = NULL;
 
-
-char MasterHash[crypto_pwhash_STRBYTES];
+unsigned char MasterKey[KEY_BYTES];
 int i;
 
 // Need to declare functions
@@ -31,7 +39,15 @@ int getMasterhash(char *out, size_t out_size);
 int check_db();
 int first_db_init();
 int request_password(char *out, size_t out_size);
-int set_master_hash(char MasterPassword);
+int set_master_key(const char *MasterPassword);
+int encrypt(const unsigned char *password, unsigned long long password_len,
+            const unsigned char *key,
+            unsigned char *nonce_out,
+            unsigned char *cipher_out);
+int decrypt(unsigned char *decrypted_password,
+            const unsigned char *ciphertext, unsigned long long ciphertext_len,
+            const unsigned char *nonce,
+            const unsigned char *key);
 
 int callback(void *NotUsed, int argc, char **argv, char **azColName)  {
     for (int i = 0; i < argc; i++){
@@ -44,12 +60,17 @@ int callback(void *NotUsed, int argc, char **argv, char **azColName)  {
 
 typedef struct StoredPassword {
   int Id;
-  uint8_t *Site;
-  uint8_t *Account;
-  uint8_t *Password;
-
+  const unsigned char *Site;
+  const unsigned char *Account;
 } StoredPassword;
 
+void dump_hex_buff(const unsigned char buf[], unsigned int len)
+{
+    for (unsigned int i = 0; i < len; i++) {
+        printf("%02X ", buf[i]);
+    }
+    printf("\n");
+}
 
 int main()
 {   
@@ -58,7 +79,7 @@ int main()
         list,
         read,
         edit
-    }CMND;
+    } CMND;
 
     if (sodium_init() < 0) {
         /* panic! the library couldn't be initialized; it is not safe to use */
@@ -69,12 +90,6 @@ int main()
         printf("Error in first step, database init\n");
     }
 
-//    MasterKeyStart:
-//    if ( AskForPassword() != 0) {
-//        printf("Couldn't log in!\n");
-//        return 1;
-//    }
-    
     Start:
 
     int command;
@@ -85,7 +100,10 @@ int main()
 
     printf("Waiting for a command\n");
 
-    scanf("%d", &command);
+    if (scanf("%d", &command) != 1) {
+        printf("Invalid input\n");
+        return 1;
+    }
 
     printf("Your command: %d\n", command);
 
@@ -105,12 +123,11 @@ int main()
         handle_read();
         goto Start;
     case edit:
-        printf("You chose to edit\n");
+        printf("You chose to edit (not implemented)\n");
         goto Start;    
 
     default:
         break;
-        sqlite3_close(db);
     }
     sqlite3_close(db);
     return 0;
@@ -134,9 +151,12 @@ int init_db()
         return 1;
     }
 
-    if (set_master_hash(MasterPassword) != 0){
+    if (set_master_key(MasterPassword) != 0){
         printf("error in hashing password\n");
     }
+
+    printf("MasterKey\n");
+    dump_hex_buff(MasterKey, sizeof MasterKey);
 
     char *err_msg  = 0;
     int response_code = sqlite3_open(SQL_FILE, &db);
@@ -144,11 +164,11 @@ int init_db()
     if (response_code != SQLITE_OK) {
         fprintf(stderr, "Cannot connect to database: %s \n", sqlite3_errmsg(db));
         sqlite3_close(db);
-        
         return 1;
     }
 
-    response_code = sqlite3_key(db, MasterPassword, strlen(MasterPassword));
+    // SQLCipher database key (uses the plaintext master password)
+    response_code = sqlite3_key(db, MasterPassword, (int)strlen(MasterPassword));
     
     if(response_code != SQLITE_OK){
         printf("failed to key database\n");
@@ -174,34 +194,41 @@ int first_db_init()
         printf("Error, could not get password!\n");
         return 1;
     }
-    if (set_master_hash(MasterPassword) != 0){
+    if (set_master_key(MasterPassword) != 0){
         printf("error in hashing password\n");
     }
+
     char *err_msg  = 0;
     int response_code = sqlite3_open(SQL_FILE, &db);
 
     if (response_code != SQLITE_OK) {
         fprintf(stderr, "Cannot connect to database: %s \n", sqlite3_errmsg(db));
         sqlite3_close(db);
-        
         return 1;
     }
 
-    response_code = sqlite3_key(db, MasterPassword, strlen(MasterPassword));
+    response_code = sqlite3_key(db, MasterPassword, (int)strlen(MasterPassword));
     
     if(response_code != SQLITE_OK){
         printf("failed to key database\n");
     }
 
-    char *sql = "CREATE TABLE IF NOT EXISTS Passwords(Id INTEGER PRIMARY KEY, Account TEXT, Site TEXT, Password TEXT);";
+    // Note: Nonce and Ciphertext are BLOB now
+    char *sql =
+        "CREATE TABLE IF NOT EXISTS Passwords("
+        "Id INTEGER PRIMARY KEY,"
+        "Account TEXT,"
+        "Site TEXT,"
+        "Password TEXT,"   /* plaintext password column – consider removing for security */
+        "Nonce BLOB,"
+        "Ciphertext BLOB);";
 
-    response_code = sqlite3_exec(db,sql, 0, 0, &err_msg);
+    response_code = sqlite3_exec(db, sql, 0, 0, &err_msg);
     if (response_code != SQLITE_OK) {
         fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
 
         sqlite3_free(err_msg);
         sqlite3_close(db);
-        
         return 1;
     }
 
@@ -212,9 +239,13 @@ int request_password(char *out, size_t out_size)
 {
     char MasterPassword[20];
 
-    printf("Please enter your password:\n");
-    scanf("%s", MasterPassword);
-    int len = strlen(MasterPassword);
+    printf("Please enter your master password:\n");
+    if (scanf("%19s", MasterPassword) != 1) {
+        fprintf(stderr, "Failed to read password\n");
+        return 1;
+    }
+
+    int len = (int)strlen(MasterPassword);
 
     if ((size_t)len >= out_size) {
         fprintf(stderr, "Buffer too small\n");
@@ -230,120 +261,231 @@ int request_password(char *out, size_t out_size)
 int handle_pass_insert() {
     char Account[30];
     char Site[40];
-    char Password[30];
+    char Password[SAVED_PASSWORD_LEN];
 
     printf("You've chosen to add a password!\n");
 
     printf("Please enter the email/account you wish to add:\n");
-    scanf("%s", Account);
+    if (scanf("%29s", Account) != 1) {
+        printf("Invalid input\n");
+        return 1;
+    }
 
     printf("Please enter the site you wish to add:\n");
-    scanf("%s", Site);
+    if (scanf("%39s", Site) != 1) {
+        printf("Invalid input\n");
+        return 1;
+    }
 
     printf("Please enter the password you wish to add:\n");
-    scanf("%s", Password);
+    if (scanf("%29s", Password) != 1) {
+        printf("Invalid input\n");
+        return 1;
+    }
 
-    printf("Here's waht you will add: %s, %s, %s \n", Account, Site, Password);
+    printf("Here's what you will add: %s, %s, %s \n", Account, Site, Password);
     
     add_pass(Account, Site, Password);
 
     return 0;
 }
 
-
 int add_pass(char *Account, char *Site, char *Password) 
 {
     char *err_msg = 0;
-    char *sql = "INSERT INTO Passwords(Account, Site, Password) VALUES(?, ?, ?);";
+    char *sql =
+        "INSERT INTO Passwords(Account, Site, Password, Nonce, Ciphertext)"
+        " VALUES(?, ?, ?, ?, ?);";
 
-    
-    //int rc = sqlite3_exec(db, sql, callback, 0, &err_msg);
-    int rc = sqlite3_prepare_v2(db, sql, strlen(sql)+1, &stmt, NULL);
+    unsigned char nonce[crypto_secretbox_NONCEBYTES];
+    size_t plaintext_len = strlen(Password);
+    size_t ciphertext_len = crypto_secretbox_MACBYTES + plaintext_len;
+    unsigned char ciphertext[ciphertext_len];
+
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-
+        fprintf(stderr, "SQL Error (prepare): %s \n", sqlite3_errmsg(db));
         sqlite3_free(err_msg);
         sqlite3_close(db);
-        
         return 1;
     }
-    
 
+    if (encrypt((const unsigned char *)Password, (unsigned long long)plaintext_len,
+                MasterKey, nonce, ciphertext) != 0) {
+        sqlite3_finalize(stmt);
+        fprintf(stderr, "Encryption error\n");
+        return 1;
+    }
 
     sqlite3_bind_text(stmt, 1, Account, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, Site, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, Password, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, Password, -1, SQLITE_STATIC); 
+    sqlite3_bind_blob(stmt, 4, nonce, crypto_secretbox_NONCEBYTES, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 5, ciphertext, (int)ciphertext_len, SQLITE_TRANSIENT);
  
     rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "SQL Error (step): %s\n", sqlite3_errmsg(db));
+    }
     sqlite3_finalize(stmt);
 
-    return rc;
+    return rc == SQLITE_DONE ? 0 : 1;
 }
 
-int set_master_hash(char MasterPassword)
+int set_master_key(const char *MasterPassword)
 {
-    if (crypto_pwhash_str(MasterHash, MasterPassword, strlen(MasterPassword), crypto_pwhash_OPSLIMIT_SENSITIVE, crypto_pwhash_MEMLIMIT_SENSITIVE) != 0) {
-    /* out of memory */
+    if (crypto_pwhash(MasterKey, sizeof MasterKey,
+                      MasterPassword, strlen(MasterPassword),
+                      SALT,
+                      crypto_pwhash_OPSLIMIT_SENSITIVE,
+                      crypto_pwhash_MEMLIMIT_SENSITIVE,
+                      crypto_pwhash_ALG_DEFAULT) != 0) {
+        /* out of memory */
+        return 1;
+    }
+    return 0;
+}
+
+int encrypt(const unsigned char *password, unsigned long long password_len,
+            const unsigned char *key,
+            unsigned char *nonce_out,
+            unsigned char *cipher_out)
+{
+    randombytes_buf(nonce_out, crypto_secretbox_NONCEBYTES);
+
+    if (crypto_secretbox_easy(cipher_out,
+                              password,
+                              password_len,
+                              nonce_out,
+                              key) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+int decrypt(unsigned char *decrypted_password,
+            const unsigned char *ciphertext, unsigned long long ciphertext_len,
+            const unsigned char *nonce,
+            const unsigned char *key)
+{
+    if (crypto_secretbox_open_easy(decrypted_password,
+                                   ciphertext,
+                                   ciphertext_len,
+                                   nonce,
+                                   key) != 0) {
+        /* message forged or corrupted */
+        return 1;
+    }
+    return 0;
+}
+
+int read_password(int* Id)
+{
+    unsigned char decrypted_password[SAVED_PASSWORD_LEN];
+
+    char *err_msg = 0;
+    char *sql =
+        "SELECT Id, Account, Site, Password, Nonce, Ciphertext "
+        "FROM Passwords WHERE Id == ?;";
+
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL Error (prepare): %s \n", sqlite3_errmsg(db));
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
         return 1;
     }
 
+    rc = sqlite3_bind_int(stmt, 1, *Id);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL Error (bind): %s \n", sqlite3_errmsg(db));
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        return 1;
+    }
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        StoredPassword spassword;
+        spassword.Id      = sqlite3_column_int(stmt, 0);
+        spassword.Account = sqlite3_column_text(stmt, 1);
+        spassword.Site    = sqlite3_column_text(stmt, 2);
+
+        const unsigned char *nonce = sqlite3_column_blob(stmt, 4);
+        int nonce_len = sqlite3_column_bytes(stmt, 4);
+
+        const unsigned char *ciphertext = sqlite3_column_blob(stmt, 5);
+        int ciphertext_len = sqlite3_column_bytes(stmt, 5);
+
+        if (nonce_len != crypto_secretbox_NONCEBYTES) {
+            fprintf(stderr, "Stored nonce has invalid length\n");
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+
+        if (ciphertext_len <= crypto_secretbox_MACBYTES ||
+            ciphertext_len - crypto_secretbox_MACBYTES > SAVED_PASSWORD_LEN - 1) {
+            fprintf(stderr, "Stored ciphertext length invalid\n");
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+
+        if (decrypt(decrypted_password,
+                    ciphertext, (unsigned long long)ciphertext_len,
+                    nonce, MasterKey) != 0) {
+            fprintf(stderr, "Decryption failed (wrong key/corrupt data)\n");
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+
+        int plaintext_len = ciphertext_len - crypto_secretbox_MACBYTES;
+        decrypted_password[plaintext_len] = '\0';
+
+        printf("Id: %d, Site: %s, Account: %s\n",
+               spassword.Id,
+               spassword.Site,
+               spassword.Account);
+
+        printf("Nonce: ");
+        dump_hex_buff(nonce, nonce_len);
+
+        printf("Ciphertext: ");
+        dump_hex_buff(ciphertext, ciphertext_len);
+
+        printf("Decrypted_Password: %s\n", decrypted_password);
+    }
+
+    sqlite3_finalize(stmt);
     return 0;
 }
 
 int handle_edit()
 {
-
+    // Not implemented
+    return 0;
 }
-
 
 int edit()
 {
-
+    // Not implemented
+    return 0;
 }
 
 int handle_read() {
     int Id;
     printf("You've chosen to read a password!\n");
     printf("Please enter the Id of the password you wish to read:\n");
-    scanf("%d", &Id);
-
-    read_password(&Id);
-    
-    return 0;
-
-}
-
-
-int read_password(int* Id)
-{
-
-    char *err_msg = 0;
-    char *sql = "SELECT Id, Site, Account, Password FROM Passwords WHERE Id == ?;";
-    
-    int rc = sqlite3_prepare_v2(db, sql, strlen(sql)+1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-        sqlite3_free(err_msg);
-        sqlite3_close(db);
-
+    if (scanf("%d", &Id) != 1) {
+        printf("Invalid input\n");
         return 1;
     }
 
-    sqlite3_bind_int(stmt, 1, *Id);
-    StoredPassword spassword;
-
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        spassword.Id = sqlite3_column_int(stmt, 0);
-        spassword.Site = (uint8_t *)sqlite3_column_text(stmt, 1);
-        spassword.Account = (uint8_t *)sqlite3_column_text(stmt, 2);
-        spassword.Password = (uint8_t *)sqlite3_column_text(stmt, 3);
-        printf("Id: %d, Site: %s, Account: %s, Password: %s\n", spassword.Id, spassword.Site, spassword.Account, spassword.Password);
+    if (read_password(&Id) != 0){
+        printf("Error in reading password!\n");
+        return 1;
     }
-
-    sqlite3_finalize(stmt);
-    return rc;
+    
+    return 0;
 }
-
 
 int list_pass() 
 {
@@ -354,25 +496,16 @@ int list_pass()
 
     if (rc != SQLITE_OK) {
         fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-
         sqlite3_free(err_msg);
         sqlite3_close(db);
-        
         return 1;
     }
 
     return 0;
 }
 
-
-
-
-
-
-
-
-
-
+/* The master password hashing / verification path below is currently unused
+   because AskForPassword() isn't called from main. Left mostly unchanged. */
 
 int checkInitiaMaster()
 {
@@ -383,10 +516,8 @@ int checkInitiaMaster()
 
     if (rc != SQLITE_OK) {
         fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-
         sqlite3_free(err_msg);
         sqlite3_close(db);
-        
         return 1;
     }
 
@@ -394,13 +525,13 @@ int checkInitiaMaster()
     if (rc != SQLITE_ROW) {
         fprintf(stderr, "SQL Error in getting hash: %s \n", sqlite3_errmsg(db));
         sqlite3_finalize(stmt);
-        
         return 1;
     }
 
     int count = sqlite3_column_int(stmt, 0);
     printf("Count of row %d", count);
 
+    sqlite3_finalize(stmt);
     return count;
 }
 
@@ -408,27 +539,25 @@ void initMasterPass() {
     char MasterPassword[20];
     char hashed_password[crypto_pwhash_STRBYTES];
 
-	printf("\n");
-	printf("Create your MASTER PASSWORD: \n");
-    scanf("%20s", MasterPassword);
+    printf("\n");
+    printf("Create your MASTER PASSWORD: \n");
+    scanf("%19s", MasterPassword);
 
-    if (crypto_pwhash_str(hashed_password, MasterPassword, strlen(MasterPassword), crypto_pwhash_OPSLIMIT_SENSITIVE, crypto_pwhash_MEMLIMIT_SENSITIVE) != 0) {
-    /* out of memory */
+    if (crypto_pwhash_str(hashed_password, MasterPassword, strlen(MasterPassword),
+                          crypto_pwhash_OPSLIMIT_SENSITIVE,
+                          crypto_pwhash_MEMLIMIT_SENSITIVE) != 0) {
+        /* out of memory */
+        return;
     }
-    
-   //printf("The hash: %s", hashed_password);
     
     char *err_msg = 0;
     char *sql = "INSERT INTO Hash(Key, Value) VALUES(?, ?);";
 
-    //int rc = sqlite3_exec(db, sql, callback, 0, &err_msg);
-    int rc = sqlite3_prepare_v2(db, sql, strlen(sql)+1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-
         sqlite3_free(err_msg);
         sqlite3_close(db);
-        
         return;
     }
 
@@ -437,18 +566,16 @@ void initMasterPass() {
  
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-
 }
 
 int getMasterhash(char *out, size_t out_size)
 {
-    // First proper function where I try to manage memory in an acceptable way
     char *err_msg = 0;
     char *sql = "Select Value from Hash where Key == \"Master\";";
 
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL praparation Error: %s \n", sqlite3_errmsg(db));
+        fprintf(stderr, "SQL preparation Error: %s \n", sqlite3_errmsg(db));
         return 1;
     }
 
@@ -456,23 +583,20 @@ int getMasterhash(char *out, size_t out_size)
     if (rc != SQLITE_ROW) {
         fprintf(stderr, "SQL Error in getting hash: %s \n", sqlite3_errmsg(db));
         sqlite3_finalize(stmt);
-        
         return 1;
     }
 
-    const char *hash = sqlite3_column_text(stmt, 0);
+    const char *hash = (const char *)sqlite3_column_text(stmt, 0);
     int len = sqlite3_column_bytes(stmt, 0);
     
-    // Remember to keep checking buffer sizes, maybe a helper function would be a good option?
     if ((size_t)len >= out_size) {
         fprintf(stderr, "Buffer too small\n");
         sqlite3_finalize(stmt);
         return 1;
     }
 
-    // First proper use of memcpy, should keep on using it as it's pure spaghetti atm
     memcpy(out, hash, len);
-    out[len] = '\0'; // not sure if null termination is always needed atm
+    out[len] = '\0';
 
     sqlite3_finalize(stmt);
 
@@ -494,33 +618,27 @@ int AskForPassword() {
         return 1;
     }
 
-	for (i = 0; i < 3; i++) {
+    for (i = 0; i < 3; i++) {
+        printf("\n");
+        printf("What is the MASTER PASSWORD: \n");
+        scanf("%19s", MasterPassword);
+        printf("\n");
 
-		printf("\n");
-		printf("What is the MASTER PASSWORD: \n");
-		scanf("%20s", MasterPassword);
-		printf("\n");
+        if (crypto_pwhash_str_verify(hashed_password,
+                                     MasterPassword,
+                                     strlen(MasterPassword)) == 0) {
+            printf(">> CORRECT PASSWORD. ACCESS CONFIRMED <<\n");
+            printf("\n");
+            return 0;
+        } else {
+            if (i == 2) {
+                printf(">> WRONG PASSWORD. ACCESS DENIED. PROGRAM ENDED <<\n");
+                printf("\n");
+                return 1; 
+            }
+            printf("Wrong password. Try again...");
+        }
+    }
 
-					
-    if (crypto_pwhash_str_verify(hashed_password, MasterPassword, strlen(MasterPassword)) == 0) {	
-			printf(">> CORRECT PASSWORD. ACCESS CONFIRMED <<\n");
-			printf("\n");
-			return 0;
-		
-		}
-		else {
-			
-			if (i == 2) {
-				
-				printf(">> WRONG PASSWORD. ACCESS DENIED. PROGRAM ENDED <<\n");
-				printf("\n");
-				return 1; 
-			}
-				
-			printf("Wrong password. Try again...");
-			
-		}	
-	
-	}
-	
+    return 1;
 }
