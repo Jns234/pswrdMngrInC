@@ -219,14 +219,11 @@ int init_db()
         return 1;
     }
 
-    printf("MasterKey\n");
-    dump_hex_buff(MasterKey, sizeof MasterKey);
-
     char *err_msg  = 0;
     int response_code = sqlite3_open(SQL_FILE, &db);
 
     if (response_code != SQLITE_OK) {
-        fprintf(stderr, "Cannot connect to database: %s \n", sqlite3_errmsg(db));
+        log_events("database", "error", "Error in the database");
         sqlite3_close(db);
         return 1;
     }
@@ -234,8 +231,10 @@ int init_db()
     response_code = sqlite3_key(db, MasterPassword, (int)strlen(MasterPassword));
     
     if(response_code != SQLITE_OK){
-        printf("failed to key database\n");
+        log_events("database", "error", "Database failure");
+        return 1;
     }
+    log_events("database", "notify", "Database creation finished");
     
     return 0;
 }
@@ -254,18 +253,19 @@ int first_db_init()
     char MasterPassword[20];
 
     if (request_password(MasterPassword, sizeof MasterPassword) != 0) {
-        printf("Error, could not get password!\n");
+        log_events("database", "error", "Database password error");
         return 1;
     }
     if (set_master_key(MasterPassword) != 0){
-        printf("error in hashing password\n");
+        log_events("database", "error", "Database password error");
+        return 1;
     }
 
     char *err_msg  = 0;
     int response_code = sqlite3_open(SQL_FILE, &db);
 
     if (response_code != SQLITE_OK) {
-        fprintf(stderr, "Cannot connect to database: %s \n", sqlite3_errmsg(db));
+        log_events("database", "error", "Error in the database");
         sqlite3_close(db);
         return 1;
     }
@@ -273,7 +273,8 @@ int first_db_init()
     response_code = sqlite3_key(db, MasterPassword, (int)strlen(MasterPassword));
     
     if(response_code != SQLITE_OK){
-        printf("failed to key database\n");
+        log_events("database", "error", "Database  error");
+        return 1;
     }
 
     char *sql =
@@ -287,13 +288,12 @@ int first_db_init()
 
     response_code = sqlite3_exec(db, sql, 0, 0, &err_msg);
     if (response_code != SQLITE_OK) {
-        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
-
+        log_events("database", "error", "Error in the database");
         sqlite3_free(err_msg);
         sqlite3_close(db);
         return 1;
     }
-
+    log_events("database", "notify", "Database creation finished");
     return 0;
 }
 
@@ -303,14 +303,14 @@ int request_password(char *out, size_t out_size)
 
     printf("Please enter your master password:\n");
     if (scanf("%19s", MasterPassword) != 1) {
-        fprintf(stderr, "Failed to read password\n");
+        log_events("program", "error", "Password error");
         return 1;
     }
 
     int len = (int)strlen(MasterPassword);
 
     if ((size_t)len >= out_size) {
-        fprintf(stderr, "Buffer too small\n");
+        log_events("program", "error", "Password error");
         return 1;
     }
 
@@ -323,7 +323,7 @@ int request_password(char *out, size_t out_size)
 int handle_pass_insert() {
     char Account[30];
     char Site[40];
-    char Password[50];  // raw password, max length 49
+    char Password[50];
 
     printf("You've chosen to add a password!\n");
 
@@ -363,7 +363,7 @@ int add_pass(char *Account, char *Site, char *Password)
     char *encodedSite     = url_encode(Site);
     char *encodedPassword = url_encode(Password);
     if (!encodedAccount || !encodedSite || !encodedPassword) {
-        fprintf(stderr, "URL encode failed\n");
+        log_events("program", "error", "Password error");
         if (encodedAccount)  free(encodedAccount);
         if (encodedSite)     free(encodedSite);
         if (encodedPassword) free(encodedPassword);
@@ -377,8 +377,8 @@ int add_pass(char *Account, char *Site, char *Password)
 
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL Error (prepare): %s \n", sqlite3_errmsg(db));
         sqlite3_free(err_msg);
+        log_events("program", "error", "Error in the database");
         sqlite3_close(db);
         free(encodedAccount);
         free(encodedSite);
@@ -389,7 +389,7 @@ int add_pass(char *Account, char *Site, char *Password)
     if (encrypt((const unsigned char *)encodedPassword, (unsigned long long)plaintext_len,
                 MasterKey, nonce, ciphertext) != 0) {
         sqlite3_finalize(stmt);
-        fprintf(stderr, "Encryption error\n");
+        log_events("program", "error", "Encryption error");
         free(encodedAccount);
         free(encodedSite);
         free(encodedPassword);
@@ -404,7 +404,8 @@ int add_pass(char *Account, char *Site, char *Password)
  
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
-        fprintf(stderr, "SQL Error (step): %s\n", sqlite3_errmsg(db));
+        log_events("program", "error", "Error in the database");
+        return 1;
     }
     sqlite3_finalize(stmt);
 
@@ -471,7 +472,7 @@ int read_password(int* Id)
 
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL Error (prepare): %s \n", sqlite3_errmsg(db));
+        log_events("program", "error", "Error in the database");
         sqlite3_free(err_msg);
         sqlite3_close(db);
         return 1;
@@ -479,7 +480,7 @@ int read_password(int* Id)
 
     rc = sqlite3_bind_int(stmt, 1, *Id);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL Error (bind): %s \n", sqlite3_errmsg(db));
+        log_events("program", "error", "Error in the database");
         sqlite3_free(err_msg);
         sqlite3_close(db);
         return 1;
@@ -498,14 +499,14 @@ int read_password(int* Id)
         int ciphertext_len = sqlite3_column_bytes(stmt, 5);
 
         if (nonce_len != crypto_secretbox_NONCEBYTES) {
-            fprintf(stderr, "Stored nonce has invalid length\n");
+            log_events("program", "error",  "Stored nonce has invalid length");
             sqlite3_finalize(stmt);
             return 1;
         }
 
         if (ciphertext_len <= crypto_secretbox_MACBYTES ||
             ciphertext_len - crypto_secretbox_MACBYTES > SAVED_PASSWORD_LEN - 1) {
-            fprintf(stderr, "Stored ciphertext length invalid\n");
+            log_events("program", "error",  "Stored ciphertext length invalid");
             sqlite3_finalize(stmt);
             return 1;
         }
@@ -513,7 +514,7 @@ int read_password(int* Id)
         if (decrypt(decrypted_password,
                     ciphertext, (unsigned long long)ciphertext_len,
                     nonce, MasterKey) != 0) {
-            fprintf(stderr, "Decryption failed (wrong key/corrupt data)\n");
+            log_events("program", "error",  "Decryption failed (wrong key/corrupt data)");
             sqlite3_finalize(stmt);
             return 1;
         }
@@ -583,7 +584,7 @@ int edit(int id, const char *newPassword)
 {
     char *encodedPassword = url_encode((char *)newPassword);
     if (!encodedPassword) {
-        fprintf(stderr, "URL encode failed in edit()\n");
+        log_events("program", "error",  "URL encode failed");
         return 1;
     }
 
