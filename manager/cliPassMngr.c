@@ -9,11 +9,13 @@
 #include <time.h>
 #include <pwd.h>
 #include <limits.h>
+#include <termios.h>
 
 #define SQL_FILE "test.db"
 #define SQLITE_HAS_CODEC 1
 #define KEY_BYTES crypto_secretbox_KEYBYTES
 #define LOG_FILE "test-log.log"
+#define MAXPW 32
 
 #define SAVED_PASSWORD_LEN 160
 
@@ -60,6 +62,7 @@ int decrypt(unsigned char *decrypted_password,
             const unsigned char *ciphertext, unsigned long long ciphertext_len,
             const unsigned char *nonce,
             const unsigned char *key);
+ssize_t getpasswd (char **pw, size_t sz, int mask, FILE *fp);
 
 typedef struct StoredPassword {
   int Id;
@@ -131,7 +134,7 @@ int main()
         edit,
         delete
     } CMND;
-
+    printf("\033[H\033[J");
     if (sodium_init() < 0) {
         log_events("Sodium", "failure", "Libsodium has failed");
         return 1;
@@ -142,9 +145,8 @@ int main()
         return 1;
     }
     log_events("program_start", "success", "The programm has started");
-
+    printf("\033[H\033[J");
 Start:
-
     int command;
 
     printf("This is the CLI Password Manager prototype!\n");
@@ -299,22 +301,26 @@ int first_db_init()
 
 int request_password(char *out, size_t out_size)
 {
-    char MasterPassword[20];
+    char pw[MAXPW] = {0};
+    char *p = pw;
+    FILE *fp = stdin;
+    ssize_t nchr = 0;
 
     printf("Please enter your master password:\n");
-    if (scanf("%19s", MasterPassword) != 1) {
-        log_events("program", "error", "Password error");
-        return 1;
-    }
+    nchr = getpasswd(&p, MAXPW, '*', fp);
+    //if (scanf("%19s", MasterPassword) != 1) {
+    //    log_events("program", "error", "Password error");
+    //    return 1;
+    //}
 
-    int len = (int)strlen(MasterPassword);
+    int len = (int)strlen(p);
 
     if ((size_t)len >= out_size) {
         log_events("program", "error", "Password error");
         return 1;
     }
 
-    memcpy(out, MasterPassword, len);
+    memcpy(out, p, len);
     out[len] = '\0';
 
     return 0;
@@ -526,19 +532,15 @@ int read_password(int* Id)
         char *decodedSite     = spassword.Site    ? url_decode((char *)spassword.Site)    : NULL;
         char *decodedPassword = url_decode((char *)decrypted_password);
 
-        printf("Id: %d, Site: %s, Account: %s\n",
-               spassword.Id,
-               decodedSite    ? decodedSite    : "(decode error)",
-               decodedAccount ? decodedAccount : "(decode error)");
+        printf("Password: %s\n", decodedPassword);
+        printf("Press ENTER when you are done viewing.\n");
 
-        printf("Nonce: ");
-        dump_hex_buff(nonce, nonce_len);
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF) {} 
+        getchar();
 
-        printf("Ciphertext: ");
-        dump_hex_buff(ciphertext, ciphertext_len);
-
-        printf("Decrypted_Password: %s\n",
-               decodedPassword ? decodedPassword : "(decode error)");
+        printf("\033[H\033[J");
+        sodium_memzero(decrypted_password, sizeof decodedPassword);
 
         if (decodedAccount)  free(decodedAccount);
         if (decodedSite)     free(decodedSite);
@@ -802,4 +804,72 @@ char *url_decode(char *str) {
   }
   *pbuf = '\0';
   return buf;
+}
+// https://stackoverflow.com/questions/6856635/hide-password-input-on-terminal
+ssize_t getpasswd (char **pw, size_t sz, int mask, FILE *fp)
+{
+    if (!pw || !sz || !fp) return -1;       /* validate input   */
+#ifdef MAXPW
+    if (sz > MAXPW) sz = MAXPW;
+#endif
+
+    if (*pw == NULL) {              /* reallocate if no address */
+        void *tmp = realloc (*pw, sz * sizeof **pw);
+        if (!tmp)
+            return -1;
+        memset (tmp, 0, sz);    /* initialize memory to 0   */
+        *pw =  (char*) tmp;
+    }
+
+    size_t idx = 0;         /* index, number of chars in read   */
+    int c = 0;
+
+    struct termios old_kbd_mode;    /* orig keyboard settings   */
+    struct termios new_kbd_mode;
+
+    if (tcgetattr (0, &old_kbd_mode)) { /* save orig settings   */
+        fprintf (stderr, "%s() error: tcgetattr failed.\n", __func__);
+        return -1;
+    }   /* copy old to new */
+    memcpy (&new_kbd_mode, &old_kbd_mode, sizeof(struct termios));
+
+    new_kbd_mode.c_lflag &= ~(ICANON | ECHO);  /* new kbd flags */
+    new_kbd_mode.c_cc[VTIME] = 0;
+    new_kbd_mode.c_cc[VMIN] = 1;
+    if (tcsetattr (0, TCSANOW, &new_kbd_mode)) {
+        fprintf (stderr, "%s() error: tcsetattr failed.\n", __func__);
+        return -1;
+    }
+
+    /* read chars from fp, mask if valid char specified */
+    while (((c = fgetc (fp)) != '\n' && c != EOF && idx < sz - 1) ||
+            (idx == sz - 1 && c == 127))
+    {
+        if (c != 127) {
+            if (31 < mask && mask < 127)    /* valid ascii char */
+                fputc (mask, stdout);
+            (*pw)[idx++] = c;
+        }
+        else if (idx > 0) {         /* handle backspace (del)   */
+            if (31 < mask && mask < 127) {
+                fputc (0x8, stdout);
+                fputc (' ', stdout);
+                fputc (0x8, stdout);
+            }
+            (*pw)[--idx] = 0;
+        }
+    }
+    (*pw)[idx] = 0; /* null-terminate   */
+
+    /* reset original keyboard  */
+    if (tcsetattr (0, TCSANOW, &old_kbd_mode)) {
+        fprintf (stderr, "%s() error: tcsetattr failed.\n", __func__);
+        return -1;
+    }
+
+    if (idx == sz - 1 && c != '\n') /* warn if pw truncated */
+        fprintf (stderr, " (%s() warning: truncated at %zu chars.)\n",
+                __func__, sz - 1);
+
+    return idx; /* number of chars in passwd    */
 }
