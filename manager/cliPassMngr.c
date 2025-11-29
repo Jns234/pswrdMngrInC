@@ -4,11 +4,14 @@
 #include <stdint.h>
 #include <sodium.h>
 #include <unistd.h>
+#include <ctype.h>   // for isdigit, tolower, isalnum
+#include <stdlib.h>  // for malloc, free
 
 #define SQL_FILE "test.db"
 #define SQLITE_HAS_CODEC 1
 #define KEY_BYTES crypto_secretbox_KEYBYTES
-#define SAVED_PASSWORD_LEN 50
+
+#define SAVED_PASSWORD_LEN 160
 
 static const unsigned char SALT[crypto_pwhash_SALTBYTES] = {
     0xC1, 0x2B, 0x5F, 0xED,
@@ -16,6 +19,12 @@ static const unsigned char SALT[crypto_pwhash_SALTBYTES] = {
     0x80, 0x4E, 0xA6, 0x93,
     0x4B, 0x1C, 0x52, 0xC6
 };
+
+// URL encode/decode declarations
+char from_hex(char ch);
+char to_hex(char code);
+char *url_encode(char *str);
+char *url_decode(char *str);
 
 // Declaring the pointer for the sqlite db
 sqlite3 *db;
@@ -48,15 +57,6 @@ int decrypt(unsigned char *decrypted_password,
             const unsigned char *nonce,
             const unsigned char *key);
 
-int callback(void *NotUsed, int argc, char **argv, char **azColName)  {
-    for (int i = 0; i < argc; i++){
-        printf("%s = %s\n", azColName[i], argv[i] ? argv[i] : "NULL" );
-    }
-    printf("\n");
-
-    return 0;
-}
-
 typedef struct StoredPassword {
   int Id;
   const unsigned char *Site;
@@ -71,6 +71,27 @@ void dump_hex_buff(const unsigned char buf[], unsigned int len)
     printf("\n");
 }
 
+
+int callback(void *NotUsed, int argc, char **argv, char **azColName)  {
+    (void)NotUsed;
+
+    for (int i = 0; i < argc; i++){
+        const char *name = azColName[i];
+        char *val = argv[i];
+
+        if (val && (strcmp(name, "Site") == 0 || strcmp(name, "Account") == 0)) {
+            char *decoded = url_decode(val);
+            printf("%s = %s\n", name, decoded ? decoded : "NULL");
+            if (decoded) free(decoded);
+        } else {
+            printf("%s = %s\n", name, val ? val : "NULL");
+        }
+    }
+    printf("\n");
+
+    return 0;
+}
+
 int main()
 {   
     typedef enum commands {
@@ -82,7 +103,6 @@ int main()
     } CMND;
 
     if (sodium_init() < 0) {
-        /* panic! the library couldn't be initialized; it is not safe to use */
         return 1;
     }
 
@@ -90,7 +110,7 @@ int main()
         printf("Error in first step, database init\n");
     }
 
-    Start:
+Start:
 
     int command;
 
@@ -216,13 +236,12 @@ int first_db_init()
         printf("failed to key database\n");
     }
 
-    // Note: Nonce and Ciphertext are BLOB now
     char *sql =
         "CREATE TABLE IF NOT EXISTS Passwords("
         "Id INTEGER PRIMARY KEY,"
         "Account TEXT,"
         "Site TEXT,"
-        "Password TEXT,"   /* plaintext password column – consider removing for security */
+        "Password TEXT,"
         "Nonce BLOB,"
         "Ciphertext BLOB);";
 
@@ -264,7 +283,7 @@ int request_password(char *out, size_t out_size)
 int handle_pass_insert() {
     char Account[30];
     char Site[40];
-    char Password[SAVED_PASSWORD_LEN];
+    char Password[50];  // raw password, max length 49
 
     printf("You've chosen to add a password!\n");
 
@@ -281,7 +300,7 @@ int handle_pass_insert() {
     }
 
     printf("Please enter the password you wish to add:\n");
-    if (scanf("%29s", Password) != 1) {
+    if (scanf("%49s", Password) != 1) {
         printf("Invalid input\n");
         return 1;
     }
@@ -300,8 +319,19 @@ int add_pass(char *Account, char *Site, char *Password)
         "INSERT INTO Passwords(Account, Site, Password, Nonce, Ciphertext)"
         " VALUES(?, ?, ?, ?, ?);";
 
+    char *encodedAccount  = url_encode(Account);
+    char *encodedSite     = url_encode(Site);
+    char *encodedPassword = url_encode(Password);
+    if (!encodedAccount || !encodedSite || !encodedPassword) {
+        fprintf(stderr, "URL encode failed\n");
+        if (encodedAccount)  free(encodedAccount);
+        if (encodedSite)     free(encodedSite);
+        if (encodedPassword) free(encodedPassword);
+        return 1;
+    }
+
     unsigned char nonce[crypto_secretbox_NONCEBYTES];
-    size_t plaintext_len = strlen(Password);
+    size_t plaintext_len = strlen(encodedPassword); 
     size_t ciphertext_len = crypto_secretbox_MACBYTES + plaintext_len;
     unsigned char ciphertext[ciphertext_len];
 
@@ -310,19 +340,25 @@ int add_pass(char *Account, char *Site, char *Password)
         fprintf(stderr, "SQL Error (prepare): %s \n", sqlite3_errmsg(db));
         sqlite3_free(err_msg);
         sqlite3_close(db);
+        free(encodedAccount);
+        free(encodedSite);
+        free(encodedPassword);
         return 1;
     }
 
-    if (encrypt((const unsigned char *)Password, (unsigned long long)plaintext_len,
+    if (encrypt((const unsigned char *)encodedPassword, (unsigned long long)plaintext_len,
                 MasterKey, nonce, ciphertext) != 0) {
         sqlite3_finalize(stmt);
         fprintf(stderr, "Encryption error\n");
+        free(encodedAccount);
+        free(encodedSite);
+        free(encodedPassword);
         return 1;
     }
 
-    sqlite3_bind_text(stmt, 1, Account, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, Site, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, Password, -1, SQLITE_STATIC); 
+    sqlite3_bind_text(stmt, 1, encodedAccount,  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, encodedSite,     -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, encodedPassword, -1, SQLITE_TRANSIENT); 
     sqlite3_bind_blob(stmt, 4, nonce, crypto_secretbox_NONCEBYTES, SQLITE_TRANSIENT);
     sqlite3_bind_blob(stmt, 5, ciphertext, (int)ciphertext_len, SQLITE_TRANSIENT);
  
@@ -331,6 +367,10 @@ int add_pass(char *Account, char *Site, char *Password)
         fprintf(stderr, "SQL Error (step): %s\n", sqlite3_errmsg(db));
     }
     sqlite3_finalize(stmt);
+
+    free(encodedAccount);
+    free(encodedSite);
+    free(encodedPassword);
 
     return rc == SQLITE_DONE ? 0 : 1;
 }
@@ -343,7 +383,6 @@ int set_master_key(const char *MasterPassword)
                       crypto_pwhash_OPSLIMIT_SENSITIVE,
                       crypto_pwhash_MEMLIMIT_SENSITIVE,
                       crypto_pwhash_ALG_DEFAULT) != 0) {
-        /* out of memory */
         return 1;
     }
     return 0;
@@ -376,7 +415,6 @@ int decrypt(unsigned char *decrypted_password,
                                    ciphertext_len,
                                    nonce,
                                    key) != 0) {
-        /* message forged or corrupted */
         return 1;
     }
     return 0;
@@ -443,10 +481,14 @@ int read_password(int* Id)
         int plaintext_len = ciphertext_len - crypto_secretbox_MACBYTES;
         decrypted_password[plaintext_len] = '\0';
 
+        char *decodedAccount  = spassword.Account ? url_decode((char *)spassword.Account) : NULL;
+        char *decodedSite     = spassword.Site    ? url_decode((char *)spassword.Site)    : NULL;
+        char *decodedPassword = url_decode((char *)decrypted_password);
+
         printf("Id: %d, Site: %s, Account: %s\n",
                spassword.Id,
-               spassword.Site,
-               spassword.Account);
+               decodedSite    ? decodedSite    : "(decode error)",
+               decodedAccount ? decodedAccount : "(decode error)");
 
         printf("Nonce: ");
         dump_hex_buff(nonce, nonce_len);
@@ -454,7 +496,12 @@ int read_password(int* Id)
         printf("Ciphertext: ");
         dump_hex_buff(ciphertext, ciphertext_len);
 
-        printf("Decrypted_Password: %s\n", decrypted_password);
+        printf("Decrypted_Password: %s\n",
+               decodedPassword ? decodedPassword : "(decode error)");
+
+        if (decodedAccount)  free(decodedAccount);
+        if (decodedSite)     free(decodedSite);
+        if (decodedPassword) free(decodedPassword);
     }
 
     sqlite3_finalize(stmt);
@@ -464,7 +511,7 @@ int read_password(int* Id)
 int handle_edit()
 {
     int Id;
-    char newPassword[SAVED_PASSWORD_LEN];
+    char newPassword[50];
 
     printf("You've chosen to edit a password!\n");
     printf("Please enter the Id of the password you wish to edit:\n");
@@ -474,7 +521,7 @@ int handle_edit()
     }
 
     printf("Please enter the NEW password:\n");
-    if (scanf("%29s", newPassword) != 1) {
+    if (scanf("%49s", newPassword) != 1) {
         printf("Invalid input\n");
         return 1;
     }
@@ -494,30 +541,38 @@ int handle_edit()
 
 int edit(int id, const char *newPassword)
 {
+    char *encodedPassword = url_encode((char *)newPassword);
+    if (!encodedPassword) {
+        fprintf(stderr, "URL encode failed in edit()\n");
+        return 1;
+    }
+
     unsigned char nonce[crypto_secretbox_NONCEBYTES];
-    size_t plaintext_len = strlen(newPassword);
+    size_t plaintext_len = strlen(encodedPassword);
 
     if (plaintext_len > SAVED_PASSWORD_LEN - 1) {
-        fprintf(stderr, "New password too long (max %d bytes)\n", SAVED_PASSWORD_LEN - 1);
+        fprintf(stderr, "New (encoded) password too long (max %d bytes)\n", SAVED_PASSWORD_LEN - 1);
+        free(encodedPassword);
         return 1;
     }
 
     size_t ciphertext_len = crypto_secretbox_MACBYTES + plaintext_len;
     unsigned char ciphertext[ciphertext_len];
 
-    if (encrypt((const unsigned char *)newPassword,
+    if (encrypt((const unsigned char *)encodedPassword,
                 (unsigned long long)plaintext_len,
                 MasterKey, nonce, ciphertext) != 0) {
         fprintf(stderr, "Encryption error in edit()\n");
         sodium_memzero(ciphertext, sizeof ciphertext);
         sodium_memzero(nonce, sizeof nonce);
+        free(encodedPassword);
         return 1;
     }
 
     char *err_msg = 0;
     char *sql =
         "UPDATE Passwords "
-        "SET Password = NULL, Nonce = ?, Ciphertext = ? "
+        "SET Password = ?, Nonce = ?, Ciphertext = ? "
         "WHERE Id == ?;";
 
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -527,12 +582,14 @@ int edit(int id, const char *newPassword)
         sqlite3_close(db);
         sodium_memzero(ciphertext, sizeof ciphertext);
         sodium_memzero(nonce, sizeof nonce);
+        free(encodedPassword);
         return 1;
     }
 
-    sqlite3_bind_blob(stmt, 1, nonce, crypto_secretbox_NONCEBYTES, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 2, ciphertext, (int)ciphertext_len, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, id);
+    sqlite3_bind_text(stmt, 1, encodedPassword, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 2, nonce, crypto_secretbox_NONCEBYTES, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 3, ciphertext, (int)ciphertext_len, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, id);
 
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
@@ -540,6 +597,7 @@ int edit(int id, const char *newPassword)
         sqlite3_finalize(stmt);
         sodium_memzero(ciphertext, sizeof ciphertext);
         sodium_memzero(nonce, sizeof nonce);
+        free(encodedPassword);
         return 1;
     }
 
@@ -547,6 +605,7 @@ int edit(int id, const char *newPassword)
 
     sodium_memzero(ciphertext, sizeof ciphertext);
     sodium_memzero(nonce, sizeof nonce);
+    free(encodedPassword);
 
     return 0;
 }
@@ -657,3 +716,49 @@ int delete_password(int id)
     return 0;
 }
 
+
+// the code down below is taken from here : https://www.geekhideout.com/urlcode.shtml
+char from_hex(char ch) {
+  return isdigit((unsigned char)ch) ? ch - '0' : tolower((unsigned char)ch) - 'a' + 10;
+}
+
+char to_hex(char code) {
+  static char hex[] = "0123456789abcdef";
+  return hex[(unsigned char)code & 15];
+}
+
+char *url_encode(char *str) {
+  char *pstr = str, *buf = malloc(strlen(str) * 3 + 1), *pbuf = buf;
+  if (!buf) return NULL;
+  while (*pstr) {
+    if (isalnum((unsigned char)*pstr) || *pstr == '-' || *pstr == '_' || *pstr == '.' || *pstr == '~') 
+      *pbuf++ = *pstr;
+    else if (*pstr == ' ') 
+      *pbuf++ = '+';
+    else 
+      *pbuf++ = '%', *pbuf++ = to_hex(*pstr >> 4), *pbuf++ = to_hex(*pstr & 15);
+    pstr++;
+  }
+  *pbuf = '\0';
+  return buf;
+}
+
+char *url_decode(char *str) {
+  char *pstr = str, *buf = malloc(strlen(str) + 1), *pbuf = buf;
+  if (!buf) return NULL;
+  while (*pstr) {
+    if (*pstr == '%') {
+      if (pstr[1] && pstr[2]) {
+        *pbuf++ = (char)(from_hex(pstr[1]) << 4 | from_hex(pstr[2]));
+        pstr += 2;
+      }
+    } else if (*pstr == '+') { 
+      *pbuf++ = ' ';
+    } else {
+      *pbuf++ = *pstr;
+    }
+    pstr++;
+  }
+  *pbuf = '\0';
+  return buf;
+}
