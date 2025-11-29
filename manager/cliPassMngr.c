@@ -493,11 +493,6 @@ int read_password(int* Id)
     }
 
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        StoredPassword spassword;
-        spassword.Id      = sqlite3_column_int(stmt, 0);
-        spassword.Account = sqlite3_column_text(stmt, 1);
-        spassword.Site    = sqlite3_column_text(stmt, 2);
-
         const unsigned char *nonce = sqlite3_column_blob(stmt, 4);
         int nonce_len = sqlite3_column_bytes(stmt, 4);
 
@@ -528,8 +523,6 @@ int read_password(int* Id)
         int plaintext_len = ciphertext_len - crypto_secretbox_MACBYTES;
         decrypted_password[plaintext_len] = '\0';
 
-        char *decodedAccount  = spassword.Account ? url_decode((char *)spassword.Account) : NULL;
-        char *decodedSite     = spassword.Site    ? url_decode((char *)spassword.Site)    : NULL;
         char *decodedPassword = url_decode((char *)decrypted_password);
 
         printf("Password: %s\n", decodedPassword);
@@ -542,8 +535,6 @@ int read_password(int* Id)
         printf("\033[H\033[J");
         sodium_memzero(decrypted_password, sizeof decodedPassword);
 
-        if (decodedAccount)  free(decodedAccount);
-        if (decodedSite)     free(decodedSite);
         if (decodedPassword) free(decodedPassword);
     }
 
@@ -579,6 +570,7 @@ int handle_edit()
     }
 
     printf("Password updated successfully.\n");
+    printf("\033[H\033[J");
     return 0;
 }
 
