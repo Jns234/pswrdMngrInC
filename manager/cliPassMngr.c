@@ -4,12 +4,16 @@
 #include <stdint.h>
 #include <sodium.h>
 #include <unistd.h>
-#include <ctype.h>   // for isdigit, tolower, isalnum
-#include <stdlib.h>  // for malloc, free
+#include <ctype.h>  
+#include <stdlib.h> 
+#include <time.h>
+#include <pwd.h>
+#include <limits.h>
 
 #define SQL_FILE "test.db"
 #define SQLITE_HAS_CODEC 1
 #define KEY_BYTES crypto_secretbox_KEYBYTES
+#define LOG_FILE "test-log.log"
 
 #define SAVED_PASSWORD_LEN 160
 
@@ -63,6 +67,32 @@ typedef struct StoredPassword {
   const unsigned char *Account;
 } StoredPassword;
 
+void log_events(char *event, char *outcome, char *message)
+{
+    FILE* log_file = fopen(LOG_FILE , "a");
+    time_t timestamp = time(NULL);
+    struct tm *t = localtime(&timestamp);
+    char buffer[100];
+    struct passwd *p=getpwuid(getuid());
+    char *username=p?p->pw_name:0;
+    char hostname[1024];
+    hostname[1023] = '\0';
+
+    gethostname(hostname, 1023);
+    strftime(buffer, sizeof(buffer), "%d-%m-%Y %H:%M:%S", t);
+
+    fprintf(log_file, "%s - %s - %s - %s - %s - %s\n",
+            buffer,
+            username,
+            hostname,
+            event,
+            outcome,
+            message);
+
+    fclose(log_file);
+}
+
+
 void dump_hex_buff(const unsigned char buf[], unsigned int len)
 {
     for (unsigned int i = 0; i < len; i++) {
@@ -103,12 +133,15 @@ int main()
     } CMND;
 
     if (sodium_init() < 0) {
+        log_events("Sodium", "failure", "Libsodium has failed");
         return 1;
     }
 
     if (init_db() != 0) {
-        printf("Error in first step, database init\n");
+        log_events("Database", "failure", "Failed to start the database");
+        return 1;
     }
+    log_events("program_start", "success", "The programm has started");
 
 Start:
 
@@ -133,21 +166,26 @@ Start:
     {
     case save:
         printf("You chose to save\n");
+        log_events("program", "notify", "Password save initiated");
         handle_pass_insert();
         goto Start;
     case list:
         printf("You chose to list\n");
+        log_events("program", "notify", "Password listing initiated");
         list_pass();
         goto Start;
     case read:
         handle_read();
+        log_events("program", "notify", "Password read initiated");
         goto Start;
     case edit:
         printf("You chose to edit\n");
+        log_events("program", "notify", "Password edit initiated");
         handle_edit();
         goto Start;    
     case delete:
         printf("You chose to delete!\n");
+        log_events("program", "notify", "Password dletion initiated");
         handle_delete();
         goto Start;
     default:
@@ -163,20 +201,22 @@ int init_db()
 
     if (check_db() != 0) {
         printf("No database file present\n");
+        log_events("database", "notify", "Database creation started");
         if (first_db_init() != 0) {
-            printf("Error initializing db!\n");
+            log_events("database", "error", "Database creation failed");
             return 1;
         } 
         return 0;
     }
 
     if (request_password(MasterPassword, sizeof MasterPassword) != 0) {
-        printf("Error, could not get password!\n");
+        log_events("database", "error", "Database password failure");
         return 1;
     }
 
     if (set_master_key(MasterPassword) != 0){
-        printf("error in hashing password\n");
+        log_events("database", "error", "Database password failure");
+        return 1;
     }
 
     printf("MasterKey\n");
@@ -731,7 +771,7 @@ char *url_encode(char *str) {
   char *pstr = str, *buf = malloc(strlen(str) * 3 + 1), *pbuf = buf;
   if (!buf) return NULL;
   while (*pstr) {
-    if (isalnum((unsigned char)*pstr) || *pstr == '-' || *pstr == '_' || *pstr == '.' || *pstr == '~') 
+    if (isalnum((unsigned char)*pstr) || *pstr == '-' || *pstr == '_' || *pstr == '.' || *pstr == '~' || *pstr == ' ') 
       *pbuf++ = *pstr;
     else if (*pstr == ' ') 
       *pbuf++ = '+';
