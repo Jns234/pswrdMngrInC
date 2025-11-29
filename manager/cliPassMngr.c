@@ -31,9 +31,10 @@ int list_pass();
 int handle_pass_insert();
 int handle_read();
 int handle_edit();
+int handle_delete();
+int delete_password(int id);
 int edit(int id, const char *newPassword);
 int read_password(int *Id);
-int checkInitiaMaster();
 int check_db();
 int first_db_init();
 int request_password(char *out, size_t out_size);
@@ -95,7 +96,7 @@ int main()
 
     printf("This is the CLI Password Manager prototype!\n");
 
-    printf("Here are your options:\n\t0 - Save a password\n\t1 - List possible passwords\n\t2 - Read a password\n\t3 - Edit a password\n");
+    printf("Here are your options:\n\t0 - Save a password\n\t1 - List possible passwords\n\t2 - Read a password\n\t3 - Edit a password\n\t4 - Delete a password\n");
 
     printf("Waiting for a command\n");
 
@@ -127,6 +128,7 @@ int main()
         goto Start;    
     case delete:
         printf("You chose to delete!\n");
+        handle_delete();
         goto Start;
     default:
         break;
@@ -584,30 +586,74 @@ int list_pass()
     return 0;
 }
 
-int checkInitiaMaster()
+int handle_delete()
+{
+    int Id;
+    char confirm;
+
+    printf("You've chosen to delete a password!\n");
+    printf("Please enter the Id of the password you wish to delete:\n");
+    if (scanf("%d", &Id) != 1) {
+        printf("Invalid input\n");
+        return 1;
+    }
+
+    printf("Are you sure you want to delete entry with Id %d? (y/N): ", Id);
+    if (scanf(" %c", &confirm) != 1) {
+        printf("Invalid input\n");
+        return 1;
+    }
+
+    if (confirm != 'y' && confirm != 'Y') {
+        printf("Deletion cancelled.\n");
+        return 0;
+    }
+
+    int rc = delete_password(Id);
+    if (rc != 0) {
+        printf("Error deleting password!\n");
+        return 1;
+    }
+
+    printf("Password deleted successfully.\n");
+    return 0;
+}
+
+int delete_password(int id)
 {
     char *err_msg = 0;
-    char *sql = "SELECT count(*) from Hash;";
+    char *sql = "DELETE FROM Passwords WHERE Id == ?;";
 
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
-
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL Error: %s \n", sqlite3_errmsg(db));
+        fprintf(stderr, "SQL Error (prepare, delete): %s\n", sqlite3_errmsg(db));
         sqlite3_free(err_msg);
         sqlite3_close(db);
         return 1;
     }
 
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) {
-        fprintf(stderr, "SQL Error in getting hash: %s \n", sqlite3_errmsg(db));
+    rc = sqlite3_bind_int(stmt, 1, id);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL Error (bind, delete): %s\n", sqlite3_errmsg(db));
         sqlite3_finalize(stmt);
         return 1;
     }
 
-    int count = sqlite3_column_int(stmt, 0);
-    printf("Count of row %d", count);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "SQL Error (step, delete): %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
 
     sqlite3_finalize(stmt);
-    return count;
+
+    int changes = sqlite3_changes(db);
+    if (changes == 0) {
+        printf("No password with Id %d was found.\n", id);
+        return 1;
+    }
+
+    return 0;
 }
+
