@@ -221,7 +221,6 @@ int init_db()
         return 1;
     }
 
-    char *err_msg  = 0;
     int response_code = sqlite3_open(SQL_FILE, &db);
 
     if (response_code != SQLITE_OK) {
@@ -304,14 +303,9 @@ int request_password(char *out, size_t out_size)
     char pw[MAXPW] = {0};
     char *p = pw;
     FILE *fp = stdin;
-    ssize_t nchr = 0;
 
     printf("Please enter your master password:\n");
-    nchr = getpasswd(&p, MAXPW, '*', fp);
-    //if (scanf("%19s", MasterPassword) != 1) {
-    //    log_events("program", "error", "Password error");
-    //    return 1;
-    //}
+    getpasswd(&p, MAXPW, '*', fp);
 
     int len = (int)strlen(p);
 
@@ -494,10 +488,10 @@ int read_password(int* Id)
 
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const unsigned char *nonce = sqlite3_column_blob(stmt, 4);
-        int nonce_len = sqlite3_column_bytes(stmt, 4);
+        unsigned int nonce_len = sqlite3_column_bytes(stmt, 4);
 
         const unsigned char *ciphertext = sqlite3_column_blob(stmt, 5);
-        int ciphertext_len = sqlite3_column_bytes(stmt, 5);
+        unsigned int ciphertext_len = sqlite3_column_bytes(stmt, 5);
 
         if (nonce_len != crypto_secretbox_NONCEBYTES) {
             log_events("program", "error",  "Stored nonce has invalid length");
