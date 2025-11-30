@@ -11,8 +11,8 @@
 #include <limits.h>
 #include <termios.h>
 
-#define SQL_FILE "test.db"
 #define SQLITE_HAS_CODEC 1
+#define SQL_FILE "test.db"
 #define KEY_BYTES crypto_secretbox_KEYBYTES
 #define LOG_FILE "test-log.log"
 #define MAXPW 32
@@ -230,6 +230,7 @@ int init_db()
     }
 
     response_code = sqlite3_key(db, MasterPassword, (int)strlen(MasterPassword));
+    sodium_memzero(MasterPassword, sizeof MasterPassword);
     
     if(response_code != SQLITE_OK){
         log_events("database", "error", "Database failure");
@@ -272,7 +273,8 @@ int first_db_init()
     }
 
     response_code = sqlite3_key(db, MasterPassword, (int)strlen(MasterPassword));
-    
+    sodium_memzero(MasterPassword, sizeof MasterPassword);
+
     if(response_code != SQLITE_OK){
         log_events("database", "error", "Database  error");
         return 1;
@@ -283,7 +285,6 @@ int first_db_init()
         "Id INTEGER PRIMARY KEY,"
         "Account TEXT,"
         "Site TEXT,"
-        "Password TEXT,"
         "Nonce BLOB,"
         "Ciphertext BLOB);";
 
@@ -356,8 +357,8 @@ int add_pass(char *Account, char *Site, char *Password)
 {
     char *err_msg = 0;
     char *sql =
-        "INSERT INTO Passwords(Account, Site, Password, Nonce, Ciphertext)"
-        " VALUES(?, ?, ?, ?, ?);";
+        "INSERT INTO Passwords(Account, Site, Nonce, Ciphertext)"
+        " VALUES(?, ?, ?, ?);";
 
     char *encodedAccount  = url_encode(Account);
     char *encodedSite     = url_encode(Site);
@@ -398,9 +399,8 @@ int add_pass(char *Account, char *Site, char *Password)
 
     sqlite3_bind_text(stmt, 1, encodedAccount,  -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, encodedSite,     -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, encodedPassword, -1, SQLITE_TRANSIENT); 
-    sqlite3_bind_blob(stmt, 4, nonce, crypto_secretbox_NONCEBYTES, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 5, ciphertext, (int)ciphertext_len, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 3, nonce, crypto_secretbox_NONCEBYTES, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 4, ciphertext, (int)ciphertext_len, SQLITE_TRANSIENT);
  
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
@@ -467,7 +467,7 @@ int read_password(int* Id)
 
     char *err_msg = 0;
     char *sql =
-        "SELECT Id, Account, Site, Password, Nonce, Ciphertext "
+        "SELECT Id, Account, Site, Nonce, Ciphertext "
         "FROM Passwords WHERE Id == ?;";
 
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -487,11 +487,11 @@ int read_password(int* Id)
     }
 
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        const unsigned char *nonce = sqlite3_column_blob(stmt, 4);
-        unsigned int nonce_len = sqlite3_column_bytes(stmt, 4);
+        const unsigned char *nonce = sqlite3_column_blob(stmt, 3);
+        unsigned int nonce_len = sqlite3_column_bytes(stmt, 3);
 
-        const unsigned char *ciphertext = sqlite3_column_blob(stmt, 5);
-        unsigned int ciphertext_len = sqlite3_column_bytes(stmt, 5);
+        const unsigned char *ciphertext = sqlite3_column_blob(stmt, 4);
+        unsigned int ciphertext_len = sqlite3_column_bytes(stmt, 4);
 
         if (nonce_len != crypto_secretbox_NONCEBYTES) {
             log_events("program", "error",  "Stored nonce has invalid length");
@@ -601,7 +601,7 @@ int edit(int id, const char *newPassword)
     char *err_msg = 0;
     char *sql =
         "UPDATE Passwords "
-        "SET Password = ?, Nonce = ?, Ciphertext = ? "
+        "SET Nonce = ?, Ciphertext = ? "
         "WHERE Id == ?;";
 
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -615,10 +615,9 @@ int edit(int id, const char *newPassword)
         return 1;
     }
 
-    sqlite3_bind_text(stmt, 1, encodedPassword, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 2, nonce, crypto_secretbox_NONCEBYTES, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 3, ciphertext, (int)ciphertext_len, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 4, id);
+    sqlite3_bind_blob(stmt, 1, nonce, crypto_secretbox_NONCEBYTES, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 2, ciphertext, (int)ciphertext_len, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, id);
 
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
