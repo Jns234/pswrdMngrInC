@@ -8,6 +8,7 @@
 #undef main
 
 // ---------- Simple test harness ----------
+// inspiration from here: https://github.com/squarewave/labrat
 
 typedef int (*test_fn)(void);
 
